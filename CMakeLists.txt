@@ -312,6 +312,7 @@ target_sources(CharactersInForeground PRIVATE modules/CharactersInForeground/Cha
 
 # DiscordIntegration main module
 set(DISCORD_CLIENT_ID "771968286199382056" CACHE STRING "DiscordIntegration mod Discord client ID")
+if (false)
 module(DiscordIntegration Default)
 target_compile_definitions(DiscordIntegration PRIVATE _CRT_SECURE_NO_WARNINGS $<$<CONFIG:Debug>:_DEBUG> ClientID="${DISCORD_CLIENT_ID}" WINVER=0x0601 _WIN32_WINNT=0x0601)
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" AND "${CMAKE_CXX_SIMULATE_ID}" STREQUAL "MSVC")
@@ -375,10 +376,16 @@ endif ()
 # DiscordIntegration Discord sdk
 install(FILES bin/discord_game_sdk.dll DESTINATION "SWRSToys/modules/DiscordIntegration/")
 install(FILES bin/discord_game_sdk.dll DESTINATION "SokuEngine/modules/DiscordIntegration/")
+endif()
 
 module(DPadFix Default)
 target_sources(DPadFix PRIVATE modules/DPadFix/DPadFix.cpp)
 target_link_libraries(DPadFix dinput8 detours)
+
+module(ChordMacro Default)
+target_sources(ChordMacro PRIVATE modules/ChordMacro/ChordMacro.cpp)
+target_include_directories(ChordMacro PRIVATE include include/directx)
+target_link_libraries(ChordMacro dinput8 detours SokuLib)
 
 module(EasyDecks Default)
 target_sources(EasyDecks PRIVATE

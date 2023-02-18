@@ -78,14 +78,14 @@ struct KeyboardInputState {
 
 	// keyboard mapping (DirectX keycodes)
 	// (read from SokuLib::KeyManager)
-	int iUp;
-	int iDown;
-	int iLeft;
-	int iRight;
-	int iA;
-	int iB;
-	int iC;
-	int iD;
+	uint8_t iUp;
+	uint8_t iDown;
+	uint8_t iLeft;
+	uint8_t iRight;
+	uint8_t iA;
+	uint8_t iB;
+	uint8_t iC;
+	uint8_t iD;
 
 	int stale = 0;
 
@@ -546,6 +546,9 @@ struct KeyboardVirtualArgs {
 	KeyboardInputState &is;
 	ExtraInput &exin;
 
+	typedef KeyboardInputState::InputCB InputCB;
+	typedef char* InputCBArg;
+
 	// returns argument for queued input, and zeroes out relevant muddling input.
 	char *prepareQueuedInput() const {
 		keystate[is.iUp]    &= 0x7F;
@@ -596,20 +599,29 @@ struct KeyboardVirtualArgs {
 		return false;
 	}
 
-	bool getMacroBInput(bool directionalOnly) const {
+	bool getMacroBInput(bool directionalOnly, bool held=false) const {
 		if (directionalOnly) {
 			 return is.enabled && !!keystate[is.iMacro];
 		} else {
+			 if (exin.ignoreHoldB && !held) return false;
 			 return !!keystate[is.iB];
 		}
 	}
 
-	bool getMacroCInput(bool directionalOnly) const {
+	bool getMacroCInput(bool directionalOnly, bool held=false) const {
 		if (directionalOnly) {
 			 return is.enabled2 && !!keystate[is.iMacro2];
 		} else {
+			 if (exin.ignoreHoldC && !held) return false;
 			 return !!keystate[is.iC];
 		}
+	}
+
+	void calcHold() const {
+		exin.holdA = !!keystate[is.iA];
+		exin.holdB = !!keystate[is.iB];
+		exin.holdC = !!keystate[is.iC];
+		exin.holdD = !!keystate[is.iD];
 	}
 };
 
@@ -621,6 +633,9 @@ struct GamepadVirtualArgs {
 
 	static const int ySensitivity = 400;
 	static const int xSensitivity = 400;
+
+	typedef VirtualInputState::InputCB InputCB;
+	typedef DIJOYSTATE* InputCBArg;
 
 	// returns argument for queued input, and zeroes out relevant muddling input.
 	DIJOYSTATE* prepareQueuedInput() const {
@@ -682,20 +697,29 @@ struct GamepadVirtualArgs {
 		return joystate->lZ > gTriggersThreshold || joystate->lZ < -gTriggersThreshold;
 	}
 
-	bool getMacroBInput(bool directionalOnly) const {
+	bool getMacroBInput(bool directionalOnly, bool held=false) const {
 		if (directionalOnly) {
 			return joystate->lZ > gTriggersThreshold;
 		} else {
+			if (exin.ignoreHoldB && !held) return false;
 			return is.iB < MAX_RGBBUTTON_INDEX ? !!joystate->rgbButtons[is.iB] : false;
 		}
 	}
 
-	bool getMacroCInput(bool directionalOnly) const {
+	bool getMacroCInput(bool directionalOnly, bool held=false) const {
 		if (directionalOnly) {
 			return joystate->lZ < -gTriggersThreshold;
 		} else {
+			if (exin.ignoreHoldC && !held) return false;
 			return is.iB < MAX_RGBBUTTON_INDEX ? !!joystate->rgbButtons[is.iB] : false;
 		}
+	}
+
+	void calcHold() const {
+		exin.holdA = is.iA < MAX_RGBBUTTON_INDEX && !!joystate->rgbButtons[is.iA];
+		exin.holdB = is.iA < MAX_RGBBUTTON_INDEX && !!joystate->rgbButtons[is.iB];
+		exin.holdC = is.iA < MAX_RGBBUTTON_INDEX && !!joystate->rgbButtons[is.iC];
+		exin.holdD = is.iA < MAX_RGBBUTTON_INDEX && !!joystate->rgbButtons[is.iD];
 	}
 };
 
@@ -712,6 +736,8 @@ static void virtualChordInput(const C& args) {
 	const bool facingRight = args.is.facingRight;
 	const int facing = facingRight ? 1 : -1;
 
+	args.calcHold();
+
 	// if there is no queued input yet, check for macro input.
 	if (args.is.queuedInput.empty() && args.is.newFrame) {
 		
@@ -724,6 +750,13 @@ static void virtualChordInput(const C& args) {
 
 		args.exin.lastDir = 0;
 
+		auto multiInputCB = [](C::InputCB a, C::InputCB b) -> C::InputCB {
+			return [a, b](C::InputCBArg arg) {
+				a(arg);
+				b(arg);
+			};
+		};
+
 		auto queue22 = [&args](int macroButton) {
 			args.is.queuedInput.emplace(args.setDirCB(0, 1));
 			args.is.queuedInput.emplace(args.setDirCB(0, 0));
@@ -733,10 +766,17 @@ static void virtualChordInput(const C& args) {
 
 		// returns a value in the range 0-11 inclusive
 		auto get623WaitTime = [&args](int facing) -> int {
+			#if 0
 			for (size_t i = DISTINCTION_FRAMES_236_623; i-- > 0;) {
 				if (args.is.dxprevs[i] == facing)
 					return i + 1;
 			}
+			#else
+			for (size_t i = DISTINCTION_FRAMES_236_623; i-- > 1;) {
+				if (args.is.dxprevs[i] == facing && args.is.dxprevs[i-1] != facing)
+					return i + 1; // FIXME: do we really need to do i+1? will i suffice?
+			}
+			#endif
 			return 0;
 		};
 
@@ -745,6 +785,9 @@ static void virtualChordInput(const C& args) {
 			// queue up the input.
 
 			int macroButton = macroB ? iB : iC;
+
+			bool macroBCPressed = (macroB && !args.is.virtualMacroBPrev) || (macroC && !args.is.virtualMacroCPrev);
+
 			args.is.virtualMacroBPrev = macroB;
 			args.is.virtualMacroCPrev = macroC;
 
@@ -753,37 +796,45 @@ static void virtualChordInput(const C& args) {
 			else if (dx == 1)  args.exin.lastDir = 3;
 			else if (dy == 1)  args.exin.lastDir = 2;
 
-			if (!gDirectionalOnly || args.exin.lastDir != args.exin.ignoreLastDir) {
+			if ((!gDirectionalOnly && macroBCPressed) || args.exin.lastDir != args.exin.ignoreLastDir) {
 				if (dx == 0 && dy == 0 && !gDirectionalOnly) {
 					// 22
 					queue22(macroButton);
 				} else if (dy == -1) {
 					// 623
+					args.is.queuedInput.emplace(args.setDirCB(facing, 0));
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(facing, 1));
 					args.is.queuedInput.emplace(args.setButtonCB(macroButton));
 					args.is.used = true;
 				} else if (dx == facing) {
 					// 236
+
+					// TODO: the reason we need to wait is in order to prevent a dash (66) input
 					const size_t wait_time = get623WaitTime(facing);
 					for (size_t i = 0; i < wait_time; ++i) {
 						args.is.queuedInput.emplace(args.setDirCB(0, 0));
 					}
+
+					// this cancels 623B/C buffering, ensuring we do 236B/C instead.
+					args.is.queuedInput.emplace(args.setButtonCB(args.is.iD));
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(facing, 1));
-					args.is.queuedInput.emplace(args.setDirCB(facing, 0));
-					args.is.queuedInput.emplace(args.setButtonCB(macroButton));
+					args.is.queuedInput.emplace(multiInputCB(args.setDirCB(facing, 0), args.setButtonCB(macroButton)));
 					args.is.used = true;
 				} else if (dx == -facing) {
 					// 214
+					// TODO: the reason we need to wait is in order to prevent a backward dash (44) input
 					const size_t wait_time = get623WaitTime(-facing);
 					for (size_t i = 0; i < wait_time; ++i) {
 						args.is.queuedInput.emplace(args.setDirCB(0, 0));
 					}
+
+					// this cancels 421B/C buffering, ensuring we do 214B/C instead.
+					args.is.queuedInput.emplace(args.setButtonCB(args.is.iD));
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(-facing, 1));
-					args.is.queuedInput.emplace(args.setDirCB(-facing, 0));
-					args.is.queuedInput.emplace(args.setButtonCB(macroButton));
+					args.is.queuedInput.emplace(multiInputCB(args.setDirCB(-facing, 0), args.setButtonCB(macroButton)));
 					args.is.used = true;
 				} else if (dy == 1) {
 					// 421
@@ -833,6 +884,11 @@ static void virtualChordInput(const C& args) {
 			args.is.queuedInput.pop();
 		}
 	}
+
+	args.exin.ignoreHoldA = args.exin.holdA;
+	args.exin.ignoreHoldB = args.exin.holdB;
+	args.exin.ignoreHoldC = args.exin.holdC;
+	args.exin.ignoreHoldD = args.exin.holdD;
 
 	// mark as processed so we don't skip a queued input if a frame is skipped.
 	args.is.newFrame = 0;

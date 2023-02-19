@@ -13,6 +13,8 @@
 #include <queue>
 #include <algorithm>
 #include <functional>
+#include "../NetInfo/PatchMan.hpp"
+#include <cstring>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -52,6 +54,7 @@ static size_t inputCounter = 0;
 static int gDirectionalOnly = 0;
 static bool gVirtualInput = true;
 static bool gDebug = false;
+static bool netEnable = false;
 
 const size_t MAX_RGBBUTTON_INDEX = sizeof(DIJOYSTATE::rgbButtons);
 
@@ -1019,6 +1022,96 @@ static void ChordInputDetectDetour()
     DetourTransactionCommit();
 }
 
+typedef int(__stdcall *recvfromFn)(SOCKET s, char *buf, int len, int flags, sockaddr *from, int *fromlen);
+static recvfromFn Original_recvfrom = NULL;
+
+typedef int(__stdcall *sendtoFn)(SOCKET s, char *buf, int len, int flags, sockaddr *to, int tolen);
+static sendtoFn Original_sendto = NULL;
+
+#define NETMON 1
+
+static const char *MARKER = "\x07" "CHORDMACRO" "\x05\x07\x05";
+
+static int __stdcall Hooksendto(SOCKET s, char *buf, int len, int flags, sockaddr *to, int tolen) {
+
+	SokuLib::Packet& packet = *reinterpret_cast<SokuLib::Packet *>(buf);
+
+	int n;
+
+	if ((packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME)
+		&& (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
+		if (len - tolen > strlen(MARKER)) {
+			 printf("SEND: GAME LOAD\n");
+			 memcpy(buf + tolen, MARKER, strlen(MARKER));
+			 n = Original_sendto(s, buf, len, flags, to, tolen + strlen(MARKER));
+
+			 return n;
+		}
+	}
+
+	#if NETMON
+	std::cout << "> ";
+	SokuLib::displayPacketContent(std::cout, packet);
+	std::cout << "\n";
+	#endif
+
+	n = Original_sendto(s, buf, len, flags, to, tolen);
+	if (n <= 0) {
+		return n;
+	}
+	
+	return n;
+}
+
+static const void* memmem(const void* haystack, size_t h, const void* needle, size_t n) {
+	if (n > h) {
+		return NULL;
+	}
+
+	for (size_t i = 0; i <= h - n; ++i) {
+		if (memcmp((const char*)haystack + i, needle, n) == 0) {
+			 return (const char*)haystack + i;
+		}
+	}
+
+	return NULL;
+}
+
+static int __stdcall Hookrecvfrom(SOCKET s, char *buf, int len, int flags, sockaddr *from, int *fromlen) {
+	int n = Original_recvfrom(s, buf, len, flags, from, fromlen);
+
+	SokuLib::Packet &packet = *reinterpret_cast<SokuLib::Packet *>(buf);
+
+	if ((packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME)
+		&& (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
+
+		if (memmem(buf, *fromlen, MARKER, strlen(MARKER))) {
+			 printf("NETPLAY: PEER APPROVES CHORDMACRO\n");
+			 netEnable = true;
+		} else {
+			 printf("NETPLAY: PEER DENIES CHORDMACRO\n");
+			 netEnable = false;
+		}
+	}
+
+	#if NETMON
+	std::cout << "< ";
+	SokuLib::displayPacketContent(std::cout, packet);
+	std::cout << "\n";
+	#endif
+
+	if (n <= 0) {
+		return n;
+	}
+
+	if (packet.type != SokuLib::PacketType::HOST_GAME && packet.type != SokuLib::PacketType::CLIENT_GAME) {
+		return n;
+	}
+
+	return n;
+}
+
+
 extern "C" {
 	__declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
 		return true;
@@ -1058,12 +1151,15 @@ extern "C" {
 		og_BattleManagerArcadeOnProcess = SokuLib::TamperDword(&VTable_BattleManagerArcade.onProcess, BattleOnProcessArcade);
 		VirtualProtect((PVOID)RDATA_SECTION_OFFSET, RDATA_SECTION_SIZE, old, &old);
    
+		Original_recvfrom = (recvfromFn)PatchMan::HookNear(0x41DAE5, (DWORD)Hookrecvfrom);
+		Original_sendto = (sendtoFn)PatchMan::HookNear(0x4171CD, (DWORD)Hooksendto);
 		if (!gVirtualInput) {
 			ChordInputDetectDetour();
 		}
 		if (gTriggersEnabled || keyboardstate[0].enabled || keyboardstate[1].enabled || keyboardstate[0].enabled2 || keyboardstate[1].enabled2) {
 			DummyDirectInput();
 		}
+
 
 		return true;
 	}

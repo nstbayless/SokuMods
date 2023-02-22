@@ -40,6 +40,14 @@ using namespace std;
 		} \
 	} while (0)
 
+
+#define fflush(...) \
+	do { \
+		if (gDebug) { \
+			fflush(__VA_ARGS__); \
+		} \
+	} while (0)
+
 HRESULT(WINAPI *oldGetDeviceState)(LPVOID IDirectInputDevice8W, DWORD cbData, LPVOID lpvData) = NULL;
 
 typedef void (__fastcall  *ChordInputDetect)(unsigned int param_1, unsigned int param_2, int param_1_00, char param_2_00, char param_3);
@@ -634,8 +642,8 @@ struct GamepadVirtualArgs {
 	VirtualInputState &is;
 	ExtraInput &exin;
 
-	static const int ySensitivity = 400;
-	static const int xSensitivity = 400;
+	static const int ySensitivity = 500;
+	static const int xSensitivity = 500;
 
 	typedef VirtualInputState::InputCB InputCB;
 	typedef DIJOYSTATE* InputCBArg;
@@ -683,8 +691,8 @@ struct GamepadVirtualArgs {
 
 	std::pair<int, int> getDirectionalInput() const {
 		return {
-			(joystate->lX > xSensitivity) - (joystate->lX < -xSensitivity),
-			(joystate->lY > ySensitivity) - (joystate->lY < -ySensitivity)
+			(joystate->lX > xSensitivity) - (joystate->lX <= -xSensitivity),
+			(joystate->lY > ySensitivity) - (joystate->lY <= -ySensitivity)
 		};
 	}
 
@@ -1028,7 +1036,7 @@ static recvfromFn Original_recvfrom = NULL;
 typedef int(__stdcall *sendtoFn)(SOCKET s, char *buf, int len, int flags, sockaddr *to, int tolen);
 static sendtoFn Original_sendto = NULL;
 
-#define NETMON 1
+#define NETMON 0
 
 static const char *MARKER = "\x07" "CHORDMACRO" "\x05\x07\x05";
 
@@ -1040,11 +1048,16 @@ static int __stdcall Hooksendto(SOCKET s, char *buf, int len, int flags, sockadd
 
 	if ((packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME)
 		&& (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
-		if (len - tolen > strlen(MARKER)) {
-			 printf("SEND: GAME LOAD\n");
-			 memcpy(buf + tolen, MARKER, strlen(MARKER));
-			 n = Original_sendto(s, buf, len, flags, to, tolen + strlen(MARKER));
+		if (len > 0) {
+			 char *buff = new char[len + strlen(MARKER)];
+			 memcpy(buff, buf, len);
+			 memcpy(buff + len, MARKER, strlen(MARKER));
 
+			 printf("SEND: APPROVE CHORDMACRO FOR PEER\n", len + strlen(MARKER));
+			 fflush(stdout);
+
+			 n = Original_sendto(s, buff, len + strlen(MARKER), flags, to, tolen);
+			 delete[] buff;
 			 return n;
 		}
 	}
@@ -1085,11 +1098,13 @@ static int __stdcall Hookrecvfrom(SOCKET s, char *buf, int len, int flags, socka
 	if ((packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME)
 		&& (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
 
-		if (memmem(buf, *fromlen, MARKER, strlen(MARKER))) {
+		if (memmem(buf, n, MARKER, strlen(MARKER))) {
 			 printf("NETPLAY: PEER APPROVES CHORDMACRO\n");
+			 fflush(stdout);
 			 netEnable = true;
 		} else {
 			 printf("NETPLAY: PEER DENIES CHORDMACRO\n");
+			 fflush(stdout);
 			 netEnable = false;
 		}
 	}
@@ -1111,6 +1126,14 @@ static int __stdcall Hookrecvfrom(SOCKET s, char *buf, int len, int flags, socka
 	return n;
 }
 
+// FUN_0040a1a0(KeymapManager*) // read inputs from devices
+typedef void(__fastcall *ReadInputs)(SokuLib::CharacterManager *cm);
+ReadInputs readInputs = reinterpret_cast<ReadInputs>((uintptr_t)(0x0046C8E0));
+
+static void __fastcall readInputsHook(SokuLib::CharacterManager *cm){
+	SokuLib::KeymapManager *keymapManager = cm->keyManager->keymapManager;
+	readInputs(cm);
+};
 
 extern "C" {
 	__declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
@@ -1153,6 +1176,12 @@ extern "C" {
    
 		Original_recvfrom = (recvfromFn)PatchMan::HookNear(0x41DAE5, (DWORD)Hookrecvfrom);
 		Original_sendto = (sendtoFn)PatchMan::HookNear(0x4171CD, (DWORD)Hooksendto);
+		{
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(&(PVOID &)readInputs, readInputsHook);
+			DetourTransactionCommit();
+		}
 		if (!gVirtualInput) {
 			ChordInputDetectDetour();
 		}

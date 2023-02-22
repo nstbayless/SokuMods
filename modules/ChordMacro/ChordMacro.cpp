@@ -24,7 +24,7 @@
 
 #ifndef vtbl_CBattleManagerArcade
 #define vtbl_CBattleManagerArcade 0x85899c
-#endif
+#endif 
 
 SokuLib::BattleManager_VTABLE &VTable_BattleManagerStory = *reinterpret_cast<SokuLib::BattleManager_VTABLE *>(vtbl_CBattleManagerStory);
 SokuLib::BattleManager_VTABLE &VTable_BattleManagerArcade = *reinterpret_cast<SokuLib::BattleManager_VTABLE *>(vtbl_CBattleManagerArcade);
@@ -65,6 +65,7 @@ static bool gDebug = false;
 static bool netEnable = false;
 
 const size_t MAX_RGBBUTTON_INDEX = sizeof(DIJOYSTATE::rgbButtons);
+const size_t RGBBUTTON_SELECT_MAP = MAX_RGBBUTTON_INDEX - 1;
 
 // how many frames we have to wait after pressing 3 before a 236 will register instead of a 623
 #define DISTINCTION_FRAMES_236_623 11
@@ -98,10 +99,11 @@ struct KeyboardInputState {
 	uint8_t iC;
 	uint8_t iD;
 
-	int stale = 0;
-
 	bool used = false; // in virtual directionalOnly mode, prevents triggering 22B/C if another chord was already performed.
 	int newFrame = 0;
+
+	int lastDir;
+	int ignoreLastDir;
 
 	bool virtualMacroBPrev = false;
 	bool virtualMacroCPrev = false;
@@ -131,6 +133,8 @@ struct VirtualInputState {
 	size_t iD = -1;
 
 	bool used = false;
+	int lastDir;
+	int ignoreLastDir;
 
 	bool virtualMacroBPrev = false;
 	bool virtualMacroCPrev = false;
@@ -141,24 +145,9 @@ typedef int VirtualInputMapKey;
 
 static std::map<VirtualInputMapKey, VirtualInputState> virtualInputStates;
 
-#define STALEMAX 20
-
-// this is only used in non-VirtualInput mode.
-// one of these stored per gamepad.
-struct ExtraInputGamepad {
-	bool lbutton;
-	bool rbutton;
-	bool lbuttonRelease;
-	bool rbuttonRelease;
-	int stale;
-	bool used;
-};
-
 // This is only used in non-virtual-input mode
 // one of these is stored per character.
 struct ExtraInput {
-	int lastDir;
-	int ignoreLastDir;
 	bool holdA;
 	bool holdB;
 	bool holdC;
@@ -175,7 +164,8 @@ struct ExtraInput {
 enum class InputAssociation {
 	UNKNOWN,
 	COMPUTER,
-	KEYBOARD,
+	KEYBOARD0,
+	KEYBOARD1,
 	JOY0,
 	JOY1
 };
@@ -185,7 +175,10 @@ static InputAssociation getInputAssociationForCharacterManager(SokuLib::Characte
 		return InputAssociation::COMPUTER;
 	} else switch (characterManager.keyManager->keymapManager->isPlayer) {
 		case -1:
-			return InputAssociation::KEYBOARD;
+			if (characterManager.isRightPlayer)
+				return InputAssociation::KEYBOARD1;
+			else
+				return InputAssociation::KEYBOARD0;
 		case 0:
 			return InputAssociation::JOY0;
 		case 1:
@@ -195,14 +188,8 @@ static InputAssociation getInputAssociationForCharacterManager(SokuLib::Characte
 	}
 }
 
-// this is used for non-virtual input.
-static ExtraInputGamepad extraInputGamepad[2];
-
-// this is used for both virtual and non-virtual input.
-// in the case of non-virtual input, one is used per player.
-// in the case of virtual input, 2 are used for the gamepads, and another 2 for the keyboards.
 static ExtraInput extraInput[2];
-
+static ExtraInput extraInputGamepads[2];
 static ExtraInput extraInputVirtualKeyboards[2];
 
 static int sign(int x) {
@@ -212,7 +199,14 @@ static int sign(int x) {
 	return -1;
 }
 
-static void altInput(SokuLib::CharacterManager &characterManager, bool& used, int stale, bool lbutton, bool rbutton, bool lrelease, bool rrelease) {
+__declspec(noinline) static void altInputPlayer(int slot) {
+
+	// character manager and extra input for this slot.
+	SokuLib::CharacterManager &characterManager = (slot == 0) ? battleMgr->leftCharacterManager : battleMgr->rightCharacterManager;
+
+	if  (!characterManager.keyManager || !characterManager.keyManager->keymapManager)
+		return;
+
 	int facing = sign(characterManager.objectBase.direction);
 	if (facing == 0)
 		facing = 1;
@@ -228,194 +222,80 @@ static void altInput(SokuLib::CharacterManager &characterManager, bool& used, in
 
 	ExtraInput &exinput = extraInput[characterManager.isRightPlayer ? 1 : 0];
 
-	exinput.lastDir = 0;
-	if (lbutton || rbutton) {
-		if (vdir == -1)
-			exinput.lastDir = 1;
-		if (vdir == 1)
-			exinput.lastDir = 2;
-		if (hdir == 1)
-			exinput.lastDir = 3;
-		if (hdir == -1)
-			exinput.lastDir = 4;
-	} else {
-		used = false;
-	}
+	const bool select = characterManager.keyManager->keymapManager;
 
-	if (stale >= STALEMAX)
-		return;
+	// all this to distinguish hold from press...
+	bool a = characterManager.keyMap.a;
+	bool b = characterManager.keyMap.b;
+	bool c = characterManager.keyMap.c;
+	bool d = characterManager.keyMap.d;
 
-	if (gDirectionalOnly) {
-		// this style does not require pressing a face button,
-		// however, it does not work with a/d buttons; it's limited to b/c only.
-		if (lrelease) {
-			characterManager.keyCombination._22b = 1;
+	exinput.holdA = a;
+	exinput.holdB = b;
+	exinput.holdC = c;
+	exinput.holdD = d;
+
+	// a/b/c/d should be true only if pressed this frame.
+	if (exinput.ignoreHoldA)
+		a = false;
+	if (exinput.ignoreHoldB)
+		b = false;
+	if (exinput.ignoreHoldC)
+		c = false;
+	if (exinput.ignoreHoldD)
+		d = false;
+
+	if (select) {
+		// prevent jumping
+		if (characterManager.keyMap.verticalAxis < 0 && !d) {
+			characterManager.keyMap.verticalAxis = 0;
 		}
-		if (rrelease) {
-			characterManager.keyCombination._22c = 1;
+		if (hdir == 0 && vdir == 0) {
+			if (a)
+				characterManager.keyCombination._22a = true;
+			if (b)
+				characterManager.keyCombination._22b = true;
+			if (c)
+				characterManager.keyCombination._22c = true;
+			if (d)
+				characterManager.keyCombination._22d = true;
+		} else if (vdir == 1) {
+			if (a)
+				characterManager.keyCombination._421a = true;
+			if (b)
+				characterManager.keyCombination._421b = true;
+			if (c)
+				characterManager.keyCombination._421c = true;
+			if (d)
+				characterManager.keyCombination._421d = true;
+		} else if (vdir == -1) {
+			if (a)
+				characterManager.keyCombination._623a = true;
+			if (b)
+				characterManager.keyCombination._623b = true;
+			if (c)
+				characterManager.keyCombination._623c = true;
+			if (d)
+				characterManager.keyCombination._623d = true;
+		} else if (hdir == 1 * facing) {
+			if (a)
+				characterManager.keyCombination._236a = true;
+			if (b)
+				characterManager.keyCombination._236b = true;
+			if (c)
+				characterManager.keyCombination._236c = true;
+			if (d)
+				characterManager.keyCombination._236d = true;
+		} else if (hdir == -1 * facing) {
+			if (a)
+				characterManager.keyCombination._214a = true;
+			if (b)
+				characterManager.keyCombination._214b = true;
+			if (c)
+				characterManager.keyCombination._214c = true;
+			if (d)
+				characterManager.keyCombination._214d = true;
 		}
-
-		if (lbutton || rbutton) {
-			if (exinput.lastDir == exinput.ignoreLastDir)
-				return;
-		}
-
-		if (lbutton) {
-			if (hdir == 1 * facing) {
-				characterManager.keyCombination._236b = 1;
-				used = true;
-			}
-			if (hdir == -1 * facing) {
-				characterManager.keyCombination._214b = 1;
-				used = true;
-			}
-			if (vdir == -1) {
-				characterManager.keyCombination._623b = 1;
-				// prevent jumping
-				characterManager.keyMap.verticalAxis = 0;
-				used = true;
-			}
-			if (vdir == 1) {
-				characterManager.keyCombination._421b = 1;
-				used = true;
-			}
-		}
-		if (rbutton) {
-			if (hdir == 1 * facing) {
-				characterManager.keyCombination._236c = 1;
-				used = true;
-			}
-			if (hdir == -1 * facing) {
-				characterManager.keyCombination._214c = 1;
-				used = true;
-			}
-			if (vdir == -1) {
-				characterManager.keyCombination._623c = 1;
-				// prevent jumping
-				characterManager.keyMap.verticalAxis = 0;
-				used = true;
-			}
-			if (vdir == 1) {
-				characterManager.keyCombination._421c = 1;
-				used = true;
-			}
-		}
-	} else {
-		// all this to distinguish hold from press...
-		bool a = characterManager.keyMap.a;
-		bool b = characterManager.keyMap.b;
-		bool c = characterManager.keyMap.c;
-		bool d = characterManager.keyMap.d;
-
-		exinput.holdA = a;
-		exinput.holdB = b;
-		exinput.holdC = c;
-		exinput.holdD = d;
-
-		// a/b/c/d should be true only if pressed this frame.
-		if (exinput.ignoreHoldA)
-			a = false;
-		if (exinput.ignoreHoldB)
-			b = false;
-		if (exinput.ignoreHoldC)
-			c = false;
-		if (exinput.ignoreHoldD)
-			d = false;
-
-		if (lbutton || rbutton) {
-			// prevent jumping
-			if (characterManager.keyMap.verticalAxis < 0 && !d) {
-				characterManager.keyMap.verticalAxis = 0;
-			}
-			if (hdir == 0 && vdir == 0) {
-				if (a)
-					characterManager.keyCombination._22a = true;
-				if (b)
-					characterManager.keyCombination._22b = true;
-				if (c)
-					characterManager.keyCombination._22c = true;
-				if (d)
-					characterManager.keyCombination._22d = true;
-			} else if (vdir == 1) {
-				if (a)
-					characterManager.keyCombination._421a = true;
-				if (b)
-					characterManager.keyCombination._421b = true;
-				if (c)
-					characterManager.keyCombination._421c = true;
-				if (d)
-					characterManager.keyCombination._421d = true;
-			} else if (vdir == -1) {
-				if (a)
-					characterManager.keyCombination._623a = true;
-				if (b)
-					characterManager.keyCombination._623b = true;
-				if (c)
-					characterManager.keyCombination._623c = true;
-				if (d)
-					characterManager.keyCombination._623d = true;
-			} else if (hdir == 1 * facing) {
-				if (a)
-					characterManager.keyCombination._236a = true;
-				if (b)
-					characterManager.keyCombination._236b = true;
-				if (c)
-					characterManager.keyCombination._236c = true;
-				if (d)
-					characterManager.keyCombination._236d = true;
-			} else if (hdir == -1 * facing) {
-				if (a)
-					characterManager.keyCombination._214a = true;
-				if (b)
-					characterManager.keyCombination._214b = true;
-				if (c)
-					characterManager.keyCombination._214c = true;
-				if (d)
-					characterManager.keyCombination._214d = true;
-			}
-		}
-	}
-}
-
-static void altInputPlayerKeyboard(SokuLib::CharacterManager& characterManager) {
-	KeyboardInputState &kis = keyboardstate[characterManager.isRightPlayer ? 1 : 0];
-	if (kis.enabled || kis.enabled2) {
-		altInput(characterManager, kis.used, kis.stale, kis.macroKeyDown, kis.macroKey2Down, kis.macroKeyRelease, kis.macroKey2Release);
-	}
-}
-
-static void altInputPlayerGamepad(SokuLib::CharacterManager &characterManager, ExtraInputGamepad &exinput) {
-	if (gTriggersEnabled) {
-		altInput(characterManager, exinput.used, exinput.stale, exinput.lbutton, exinput.rbutton, exinput.lbuttonRelease, exinput.rbuttonRelease);
-	}
-}
-
-__declspec(noinline) static void altInputPlayer(int slot) {
-	if (slot == 1) {
-		// player 1 only, except local vs mode
-		switch (SokuLib::mainMode) {
-		case SokuLib::BATTLE_MODE_VSPLAYER:
-			break;
-		default:
-			return;
-		}
-	}
-
-	// character manager and extra input for this slot.
-	SokuLib::CharacterManager &characterManager = (slot == 0) ? battleMgr->leftCharacterManager : battleMgr->rightCharacterManager;
-
-	switch (getInputAssociationForCharacterManager(characterManager)) {
-	case InputAssociation::KEYBOARD:
-		altInputPlayerKeyboard(characterManager);
-		break;
-	case InputAssociation::JOY0:
-		altInputPlayerGamepad(characterManager, extraInputGamepad[0]);
-		break;
-	case InputAssociation::JOY1:
-		altInputPlayerGamepad(characterManager, extraInputGamepad[1]);
-		break;
-	default:
-		return;
 	}
 }
 
@@ -435,9 +315,6 @@ static inline bool macroInputEnabled() {
 
 __declspec(noinline) static void altInput()
 {
-	if (!macroInputEnabled())
-		return;
-
 	 if (battleMgr && !gVirtualInput) {
 		 altInputPlayer(0);
 		 altInputPlayer(1);
@@ -458,7 +335,8 @@ static void setVirtualInputStateGameData(int slot) {
 		 SokuLib::CharacterManager &characterManager = (slot == 0) ? battleMgr->leftCharacterManager : battleMgr->rightCharacterManager;
 		 bool facingRight = characterManager.objectBase.direction == SokuLib::Direction::RIGHT;
 		 switch (InputAssociation ia = getInputAssociationForCharacterManager(characterManager)) {
-		 case InputAssociation::KEYBOARD:
+		 case InputAssociation::KEYBOARD0:
+		 case InputAssociation::KEYBOARD1:
 			keyboardstate[slot].facingRight = facingRight;
 			keyboardstate[slot].iUp = characterManager.keyManager->keymapManager->bindingUp;
 			keyboardstate[slot].iDown = characterManager.keyManager->keymapManager->bindingDown;
@@ -489,8 +367,36 @@ static int (SokuLib::BattleManager::*og_BattleManagerOnProcess)() = nullptr;
 static int (SokuLib::BattleManager::*og_BattleManagerStoryOnProcess)() = nullptr;
 static int (SokuLib::BattleManager::*og_BattleManagerArcadeOnProcess)() = nullptr;
 
+static void setMacroBindings(SokuLib::CharacterManager &cm) {
+	switch (getInputAssociationForCharacterManager(cm)) {
+	case InputAssociation::KEYBOARD0:
+		 cm.keyManager->keymapManager->bindingSelect = keyboardstate[0].iMacro;
+		 break;
+	case InputAssociation::KEYBOARD1:
+		 cm.keyManager->keymapManager->bindingSelect = keyboardstate[1].iMacro;
+		 break;
+	case InputAssociation::JOY0:
+	case InputAssociation::JOY1:
+		 cm.keyManager->keymapManager->bindingSelect = RGBBUTTON_SELECT_MAP;
+		 break;
+	default:
+		 break;
+	}
+}
+
 static void interceptBattleOnProcess() {
 	inputCounter = 0;
+
+	setMacroBindings(battleMgr->leftCharacterManager);
+	setMacroBindings(battleMgr->rightCharacterManager);
+
+	for (size_t i = 0; i <= 1; ++i) {
+		 extraInput[i].ignoreHoldA = extraInput[i].holdA;
+		 extraInput[i].ignoreHoldB = extraInput[i].holdB;
+		 extraInput[i].ignoreHoldC = extraInput[i].holdC;
+		 extraInput[i].ignoreHoldD = extraInput[i].holdD;
+	}
+
 	if (gVirtualInput) {
 		 setVirtualInputStateGameData(0);
 		 setVirtualInputStateGameData(1);
@@ -504,20 +410,6 @@ static void interceptBattleOnProcess() {
 				it = virtualInputStates.erase(it);
 			} else {
 				++it;
-			}
-		 }
-	} else {
-		 for (size_t i = 0; i <= 1; ++i) {
-			extraInput[i].ignoreLastDir = extraInput[i].lastDir;
-			extraInput[i].ignoreHoldA = extraInput[i].holdA;
-			extraInput[i].ignoreHoldB = extraInput[i].holdB;
-			extraInput[i].ignoreHoldC = extraInput[i].holdC;
-			extraInput[i].ignoreHoldD = extraInput[i].holdD;
-			if (extraInputGamepad[i].stale < STALEMAX) {
-				extraInputGamepad[i].stale++;
-			}
-			if (keyboardstate[i].stale < STALEMAX) {
-				keyboardstate[i].stale++;
 			}
 		 }
 	}
@@ -759,7 +651,7 @@ static void virtualChordInput(const C& args) {
 		int dx = dxy.first;
 		int dy = dxy.second;
 
-		args.exin.lastDir = 0;
+		args.is.lastDir = 0;
 
 		auto multiInputCB = [](C::InputCB a, C::InputCB b) -> C::InputCB {
 			return [a, b](C::InputCBArg arg) {
@@ -802,12 +694,12 @@ static void virtualChordInput(const C& args) {
 			args.is.virtualMacroBPrev = macroB;
 			args.is.virtualMacroCPrev = macroC;
 
-			if (dy == -1)      args.exin.lastDir = 1;
-			else if (dx == -1) args.exin.lastDir = 2;
-			else if (dx == 1)  args.exin.lastDir = 3;
-			else if (dy == 1)  args.exin.lastDir = 2;
+			if (dy == -1)      args.is.lastDir = 1;
+			else if (dx == -1) args.is.lastDir = 2;
+			else if (dx == 1)  args.is.lastDir = 3;
+			else if (dy == 1)  args.is.lastDir = 2;
 
-			if ((!gDirectionalOnly && macroBCPressed) || args.exin.lastDir != args.exin.ignoreLastDir) {
+			if ((!gDirectionalOnly && macroBCPressed) || args.is.lastDir != args.is.ignoreLastDir) {
 				if (dx == 0 && dy == 0 && !gDirectionalOnly) {
 					// 22
 					queue22(macroButton);
@@ -876,7 +768,7 @@ static void virtualChordInput(const C& args) {
 		}
 		args.is.dxprevs[DISTINCTION_FRAMES_236_623 - 1] = dx;
 
-		args.exin.ignoreLastDir = args.exin.lastDir;
+		args.is.ignoreLastDir = args.is.lastDir;
 
 		// prevent jumping if macro button is held unless the 'fly' button is also held.
 		if (args.getMacroInput()) args.preventJumping();
@@ -911,84 +803,55 @@ static void interceptDeviceStateKeyboard(char *keystate) {
 		if ((kis.enabled || kis.enabled2) && macroInputEnabled()) {
 			if (gVirtualInput) {
 				virtualChordInput<KeyboardVirtualArgs>({keystate, kis, extraInputVirtualKeyboards[i]});
-			} else {
-				bool prevdown = kis.macroKeyDown;
-				bool prevdown2 = kis.macroKey2Down;
-				kis.stale = 0;
-				kis.macroKeyDown = kis.enabled && !!keystate[kis.iMacro];
-				kis.macroKey2Down = kis.enabled2 && !!keystate[kis.iMacro2];
-				if (kis.used) {
-					kis.macroKeyRelease = false;
-					kis.macroKey2Release = false;
-				} else {
-					kis.macroKeyRelease = prevdown && !kis.macroKeyDown;
-					kis.macroKey2Release = prevdown2 && !kis.macroKey2Down;
-				}
 			}
 		}
 	}
 }
 
 static void interceptDeviceStateGamepad(DIJOYSTATE* joystate) {
-	// reset state in menu
-	switch (SokuLib::sceneId) {
-	case SokuLib::SCENE_LOGO:
-	case SokuLib::SCENE_OPENING:
-	case SokuLib::SCENE_TITLE:
-		virtualInputStates.clear();
-		break;
-	default:
-		break;
-	}
 
 	size_t slot = inputCounter++;
 
 	printf("Slot %d: %d %d\n", slot, joystate->rgbButtons[0], joystate->lZ);
 
 	if (gVirtualInput && gTriggersEnabled && slot < 2) {
-		virtualChordInput<GamepadVirtualArgs>({joystate, slot, virtualInputStates[slot], extraInput[slot]});
+		virtualChordInput<GamepadVirtualArgs>({joystate, slot, virtualInputStates[slot], extraInputGamepads[slot]});
 	}
 
-	if (slot < 2 && !gVirtualInput) {
-		ExtraInputGamepad &exin = extraInputGamepad[slot];
-		bool prevl = exin.lbutton;
-		bool prevr = exin.rbutton;
-		exin.lbutton = false;
-		exin.rbutton = false;
-		exin.lbuttonRelease = false;
-		exin.rbuttonRelease = false;
-
-		exin.stale = 0;
-
+	else if (!gVirtualInput) {
 		if (gTriggersEnabled) {
+			 joystate->rgbButtons[RGBBUTTON_SELECT_MAP] = 0x0;
+
 			 if (joystate->lZ < -gTriggersThreshold) {
-				exin.rbutton = true;
+				joystate->rgbButtons[RGBBUTTON_SELECT_MAP] |= 0x80;
 			 }
 
 			 if (joystate->lZ > gTriggersThreshold) {
-				exin.lbutton = true;
-			 }
-
-			 if (!exin.used) {
-				if (prevl && !exin.lbutton) {
-					exin.lbuttonRelease = true;
-				}
-
-				if (prevr && !exin.rbutton) {
-					exin.rbuttonRelease = true;
-				}
+				joystate->rgbButtons[RGBBUTTON_SELECT_MAP] |= 0x80;
 			 }
 		}
 	}
 }
 
 static HRESULT WINAPI myGetDeviceState(LPVOID IDirectInputDevice8W, DWORD cbData, LPVOID lpvData) {
-	uintptr_t returnaddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
 
 	HRESULT retValue = oldGetDeviceState(IDirectInputDevice8W, cbData, lpvData);
 
 	if (retValue != DI_OK || cbData == sizeof(DIJOYSTATE2)) {
 		return retValue;
+	}
+
+	// reset state in menus
+	switch (SokuLib::sceneId) {
+	case SokuLib::SCENE_BATTLE:
+	case SokuLib::SCENE_BATTLECL:
+	case SokuLib::SCENE_BATTLESV:
+	case SokuLib::SCENE_BATTLEWATCH:
+		break;
+	default:
+		virtualInputStates.clear();
+		memset(&extraInput, 0, 2 * sizeof(extraInput));
+		break;
 	}
 
 	if (cbData == sizeof(DIJOYSTATE)) {

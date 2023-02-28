@@ -15,8 +15,12 @@
 #include <functional>
 #include "../NetInfo/PatchMan.hpp"
 #include <cstring>
+#include <mutex>
 
-#pragma intrinsic(_ReturnAddress)
+#if __has_include ("hardwarebp.cpp")
+#include "hardwarebp.cpp"
+#endif
+
 
 #ifndef vtbl_CBattleManagerStory
 #define vtbl_CBattleManagerStory 0x858934
@@ -53,7 +57,19 @@ HRESULT(WINAPI *oldGetDeviceState)(LPVOID IDirectInputDevice8W, DWORD cbData, LP
 typedef void (__fastcall  *ChordInputDetect)(unsigned int param_1, unsigned int param_2, int param_1_00, char param_2_00, char param_3);
 ChordInputDetect cidfn = reinterpret_cast<ChordInputDetect>((uintptr_t)(0x0046CC90));
 
-SokuLib::BattleManager *battleMgr;
+static SokuLib::BattleManager *battleMgr;
+
+static std::mutex selectKeyFrameLookupMutex;
+static std::map<uint32_t, bool> selectKeyFrameLookup;
+
+static void setSelectKeyForFrame(SokuLib::CharacterManager &cm) {
+	uint32_t id = !!(cm.isRightPlayer);
+	id |= (battleMgr->frameId * 2);
+	if (cm.keyManager && cm.keyManager->keymapManager && !cm.keyManager->keymapManager->readInKeys) {
+		std::lock_guard<std::mutex> guard(selectKeyFrameLookupMutex);
+		selectKeyFrameLookup[id] = cm.keyManager->keymapManager->select;
+	}
+}
 
 static bool enable = 1;
 static int gTriggersThreshold = 500;
@@ -173,6 +189,8 @@ enum class InputAssociation {
 static InputAssociation getInputAssociationForCharacterManager(SokuLib::CharacterManager &characterManager) {
 	if (!characterManager.keyManager || !characterManager.keyManager->keymapManager) {
 		return InputAssociation::COMPUTER;
+	} else if (characterManager.keyManager->keymapManager->readInKeys) {
+		return InputAssociation::UNKNOWN;
 	} else switch (characterManager.keyManager->keymapManager->isPlayer) {
 		case -1:
 			if (characterManager.isRightPlayer)
@@ -222,7 +240,7 @@ __declspec(noinline) static void altInputPlayer(int slot) {
 
 	ExtraInput &exinput = extraInput[characterManager.isRightPlayer ? 1 : 0];
 
-	const bool select = characterManager.keyManager->keymapManager;
+	const bool select = characterManager.keyManager->keymapManager->select;
 
 	// all this to distinguish hold from press...
 	bool a = characterManager.keyMap.a;
@@ -387,6 +405,11 @@ static void setMacroBindings(SokuLib::CharacterManager &cm) {
 static void interceptBattleOnProcess() {
 	inputCounter = 0;
 
+	if (battleMgr->frameId == 0) {
+		 std::lock_guard<std::mutex> guard(selectKeyFrameLookupMutex);
+		 selectKeyFrameLookup.clear();
+	}
+
 	setMacroBindings(battleMgr->leftCharacterManager);
 	setMacroBindings(battleMgr->rightCharacterManager);
 
@@ -443,6 +466,10 @@ static int __fastcall BattleOnProcessArcade(SokuLib::BattleManager *This) {
 #define AXIS_ORTHO 1000
 #define AXIS_DIAG 707
 #define BUTTON_PRESSED 0x80
+
+//replay_assemble_outs 0042d960
+//replay_write_x 0042d770
+//replay_write 0042cf90
 
 struct KeyboardVirtualArgs {
 	char *keystate;
@@ -909,7 +936,9 @@ static int __stdcall Hooksendto(SOCKET s, char *buf, int len, int flags, sockadd
 
 	int n;
 
-	if ((packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME)
+	bool game = (packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME);
+
+	if (game 
 		&& (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
 		if (len > 0) {
 			 char *buff = new char[len + strlen(MARKER)];
@@ -930,6 +959,19 @@ static int __stdcall Hooksendto(SOCKET s, char *buf, int len, int flags, sockadd
 	SokuLib::displayPacketContent(std::cout, packet);
 	std::cout << "\n";
 	#endif
+
+	if (game && packet.game.event.type == SokuLib::GAME_INPUT && netEnable && !gVirtualInput) {
+		SokuLib::GameInputEvent &input = packet.game.event.input;
+		if (input.sceneId == SokuLib::SCENEID_BATTLE) {
+			 std::lock_guard<std::mutex> guard(selectKeyFrameLookupMutex);
+			 int right = (packet.type == SokuLib::CLIENT_GAME); // client is always the right player.
+			 for (size_t i = 0; i < input.inputCount; ++i) {
+				//input.inputs[i].battle.select = selectKeyFrameLookup[2 * (input.frameId + i) + right];
+				printf("%d %d\n", (input.frameId+i), (input.inputs[i].battle.select));
+				fflush(stdout);
+			 }
+		}
+	}
 
 	n = Original_sendto(s, buf, len, flags, to, tolen);
 	if (n <= 0) {
@@ -993,9 +1035,38 @@ static int __stdcall Hookrecvfrom(SOCKET s, char *buf, int len, int flags, socka
 typedef void(__fastcall *ReadInputs)(SokuLib::CharacterManager *cm);
 ReadInputs readInputs = reinterpret_cast<ReadInputs>((uintptr_t)(0x0046C8E0));
 
+typedef void(__fastcall *ReadInputsFromDevice)(SokuLib::KeymapManager *km);
+ReadInputsFromDevice readInputsFromDevice = reinterpret_cast<ReadInputsFromDevice>((uintptr_t)(0x0040a1a0));
+ReadInputsFromDevice readInputsIntermediate = reinterpret_cast<ReadInputsFromDevice>((uintptr_t)(0x0040a370));
+
+static SokuLib::CharacterManager *localcm = nullptr;
+
+static void __fastcall readInputsFromDeviceHook(SokuLib::KeymapManager *km) {
+
+	if (!localcm && netEnable) {
+		// netplay input select map
+		if (km->isPlayer == -1) {
+			 if (keyboardstate[0].enabled) {
+				km->bindingSelect = keyboardstate[0].iMacro;
+			 }
+		} else if (km->isPlayer == 0 || km->isPlayer == 1) {
+			 if (gTriggersEnabled) {
+				km->bindingSelect = RGBBUTTON_SELECT_MAP;
+			 }
+		}
+	}
+
+	readInputsFromDevice(km);
+
+	if (localcm && localcm->keyManager->keymapManager == km) {
+		setSelectKeyForFrame(*localcm);
+	}
+};
+
 static void __fastcall readInputsHook(SokuLib::CharacterManager *cm){
-	SokuLib::KeymapManager *keymapManager = cm->keyManager->keymapManager;
+	localcm = cm;
 	readInputs(cm);
+	localcm = nullptr;
 };
 
 extern "C" {
@@ -1036,6 +1107,20 @@ extern "C" {
 		og_BattleManagerStoryOnProcess = SokuLib::TamperDword(&VTable_BattleManagerStory.onProcess, BattleOnProcessStory);
 		og_BattleManagerArcadeOnProcess = SokuLib::TamperDword(&VTable_BattleManagerArcade.onProcess, BattleOnProcessArcade);
 		VirtualProtect((PVOID)RDATA_SECTION_OFFSET, RDATA_SECTION_SIZE, old, &old);
+
+		// enable sending SELECT over the network.
+		char *patchaddr3 = (char *)0x004559d5;
+		char *patchaddr4 = (char *)0x00454cc0;
+		char *patchaddr5 = (char *)0x00454cd5;
+
+		VirtualProtect(patchaddr3, 100, PAGE_EXECUTE_WRITECOPY, &old);
+		patchaddr3[3] = 8|3;
+		VirtualProtect(patchaddr3, 100, old, &old);
+		
+		VirtualProtect(patchaddr4, 100, PAGE_EXECUTE_WRITECOPY, &old);
+		patchaddr4[3] = 8|3;
+		patchaddr5[4] = 8|3;
+		VirtualProtect(patchaddr4, 100, old, &old);
    
 		Original_recvfrom = (recvfromFn)PatchMan::HookNear(0x41DAE5, (DWORD)Hookrecvfrom);
 		Original_sendto = (sendtoFn)PatchMan::HookNear(0x4171CD, (DWORD)Hooksendto);
@@ -1043,11 +1128,10 @@ extern "C" {
 			DetourTransactionBegin();
 			DetourUpdateThread(GetCurrentThread());
 			DetourAttach(&(PVOID &)readInputs, readInputsHook);
+			DetourAttach(&(PVOID &)readInputsFromDevice, readInputsFromDeviceHook);
 			DetourTransactionCommit();
 		}
-		if (!gVirtualInput) {
-			ChordInputDetectDetour();
-		}
+		ChordInputDetectDetour();
 		if (gTriggersEnabled || keyboardstate[0].enabled || keyboardstate[1].enabled || keyboardstate[0].enabled2 || keyboardstate[1].enabled2) {
 			DummyDirectInput();
 		}

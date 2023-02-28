@@ -17,11 +17,6 @@
 #include <cstring>
 #include <mutex>
 
-#if __has_include ("hardwarebp.cpp")
-#include "hardwarebp.cpp"
-#endif
-
-
 #ifndef vtbl_CBattleManagerStory
 #define vtbl_CBattleManagerStory 0x858934
 #endif
@@ -59,23 +54,9 @@ ChordInputDetect cidfn = reinterpret_cast<ChordInputDetect>((uintptr_t)(0x0046CC
 
 static SokuLib::BattleManager *battleMgr;
 
-static std::mutex selectKeyFrameLookupMutex;
-static std::map<uint32_t, bool> selectKeyFrameLookup;
-
-static void setSelectKeyForFrame(SokuLib::CharacterManager &cm) {
-	uint32_t id = !!(cm.isRightPlayer);
-	id |= (battleMgr->frameId * 2);
-	if (cm.keyManager && cm.keyManager->keymapManager && !cm.keyManager->keymapManager->readInKeys) {
-		std::lock_guard<std::mutex> guard(selectKeyFrameLookupMutex);
-		selectKeyFrameLookup[id] = cm.keyManager->keymapManager->select;
-	}
-}
-
-static bool enable = 1;
 static int gTriggersThreshold = 500;
 static int gTriggersEnabled = 0;
 static size_t inputCounter = 0;
-static int gDirectionalOnly = 0;
 static bool gVirtualInput = true;
 static bool gDebug = false;
 static bool netEnable = false;
@@ -88,9 +69,7 @@ const size_t RGBBUTTON_SELECT_MAP = MAX_RGBBUTTON_INDEX - 1;
 
 struct KeyboardInputState {
 	bool enabled = false;
-	bool enabled2 = false;
 	uint8_t iMacro = DIK_LSHIFT;
-	uint8_t iMacro2 = DIK_LCONTROL;
 	bool macroKeyDown;
 	bool macroKeyRelease;
 	bool macroKey2Down;
@@ -115,11 +94,7 @@ struct KeyboardInputState {
 	uint8_t iC;
 	uint8_t iD;
 
-	bool used = false; // in virtual directionalOnly mode, prevents triggering 22B/C if another chord was already performed.
 	int newFrame = 0;
-
-	int lastDir;
-	int ignoreLastDir;
 
 	bool virtualMacroBPrev = false;
 	bool virtualMacroCPrev = false;
@@ -147,10 +122,6 @@ struct VirtualInputState {
 	size_t iB = -1;
 	size_t iC = -1;
 	size_t iD = -1;
-
-	bool used = false;
-	int lastDir;
-	int ignoreLastDir;
 
 	bool virtualMacroBPrev = false;
 	bool virtualMacroCPrev = false;
@@ -217,6 +188,13 @@ static int sign(int x) {
 	return -1;
 }
 
+// This function directly (!) triggers chord-input recognition, which normally
+// is only triggered when the correct key sequence (e.g. 236B) is input.
+// 
+// This is called redundantly dozens of times in the battle update loop,
+// because we weren't exactly sure when exactly was the right moment,
+// so we opted for idempotent spamming.
+
 __declspec(noinline) static void altInputPlayer(int slot) {
 
 	// character manager and extra input for this slot.
@@ -264,7 +242,7 @@ __declspec(noinline) static void altInputPlayer(int slot) {
 		d = false;
 
 	if (select) {
-		// prevent jumping
+		// prevent jumping (needed for up-combo)
 		if (characterManager.keyMap.verticalAxis < 0 && !d) {
 			characterManager.keyMap.verticalAxis = 0;
 		}
@@ -318,17 +296,27 @@ __declspec(noinline) static void altInputPlayer(int slot) {
 }
 
 // returns true if macro input should be performable at this time. (i.e. when in battle.)
+// Note that this only physical input devices; received chord inputs from replays or network will
+// still function.
 static inline bool macroInputEnabled() {
 	// (thanks PinkySmile!)
 	// 
 	// Disable outside of VSPlayer and VSCom
-	if (SokuLib::sceneId != SokuLib::SCENE_BATTLE)
+	switch(SokuLib::sceneId) {
+	case SokuLib::SCENE_BATTLE:
+		return true;
+	case SokuLib::SCENE_BATTLECL:
+	case SokuLib::SCENE_BATTLESV:
+		return netEnable;
+	default:
 		return false;
+	}
+
 	// Also disable in replays
 	if (SokuLib::subMode == SokuLib::BATTLE_SUBMODE_REPLAY)
 		return false;
 
-	return enable;
+	return true;
 }
 
 __declspec(noinline) static void altInput()
@@ -346,6 +334,10 @@ void __fastcall MyChordInputDetect(unsigned int param_1,unsigned int param_2,int
 	cidfn(param_1, param_2, param_1_00, param_2_00, param_3);
 }
 
+// communicates some game state to the virtual input methods.
+// This isn't thread-safe, but it doesn't need to be; data errors in the
+// direct input thread should be handed gracefully. And these values are all individually atomic anyway.
+// 
 // figures out which controllers are facing left vs which are facing right.
 // also figures out the button mapping for each controller, reading from SokuLib::KeyManager
 static void setVirtualInputStateGameData(int slot) {
@@ -404,11 +396,6 @@ static void setMacroBindings(SokuLib::CharacterManager &cm) {
 
 static void interceptBattleOnProcess() {
 	inputCounter = 0;
-
-	if (battleMgr->frameId == 0) {
-		 std::lock_guard<std::mutex> guard(selectKeyFrameLookupMutex);
-		 selectKeyFrameLookup.clear();
-	}
 
 	setMacroBindings(battleMgr->leftCharacterManager);
 	setMacroBindings(battleMgr->rightCharacterManager);
@@ -524,27 +511,18 @@ struct KeyboardVirtualArgs {
 
 	bool getMacroInput() const {
 		if (is.enabled && keystate[is.iMacro]) return true;
-		if (is.enabled2 && keystate[is.iMacro2]) return true;
 
 		return false;
 	}
 
-	bool getMacroBInput(bool directionalOnly, bool held=false) const {
-		if (directionalOnly) {
-			 return is.enabled && !!keystate[is.iMacro];
-		} else {
-			 if (exin.ignoreHoldB && !held) return false;
-			 return !!keystate[is.iB];
-		}
+	bool getMacroBInput(bool held=false) const {
+		if (exin.ignoreHoldB && !held) return false;
+		return !!keystate[is.iB];
 	}
 
-	bool getMacroCInput(bool directionalOnly, bool held=false) const {
-		if (directionalOnly) {
-			 return is.enabled2 && !!keystate[is.iMacro2];
-		} else {
-			 if (exin.ignoreHoldC && !held) return false;
-			 return !!keystate[is.iC];
-		}
+	bool getMacroCInput(bool held=false) const {
+		if (exin.ignoreHoldC && !held) return false;
+		return !!keystate[is.iC];
 	}
 
 	void calcHold() const {
@@ -627,22 +605,14 @@ struct GamepadVirtualArgs {
 		return joystate->lZ > gTriggersThreshold || joystate->lZ < -gTriggersThreshold;
 	}
 
-	bool getMacroBInput(bool directionalOnly, bool held=false) const {
-		if (directionalOnly) {
-			return joystate->lZ > gTriggersThreshold;
-		} else {
-			if (exin.ignoreHoldB && !held) return false;
-			return is.iB < MAX_RGBBUTTON_INDEX ? !!joystate->rgbButtons[is.iB] : false;
-		}
+	bool getMacroBInput(bool held=false) const {
+		if (exin.ignoreHoldB && !held) return false;
+		return is.iB < MAX_RGBBUTTON_INDEX ? !!joystate->rgbButtons[is.iB] : false;
 	}
 
-	bool getMacroCInput(bool directionalOnly, bool held=false) const {
-		if (directionalOnly) {
-			return joystate->lZ < -gTriggersThreshold;
-		} else {
-			if (exin.ignoreHoldC && !held) return false;
-			return is.iB < MAX_RGBBUTTON_INDEX ? !!joystate->rgbButtons[is.iB] : false;
-		}
+	bool getMacroCInput(bool held=false) const {
+		if (exin.ignoreHoldC && !held) return false;
+		return is.iB < MAX_RGBBUTTON_INDEX ? !!joystate->rgbButtons[is.iB] : false;
 	}
 
 	void calcHold() const {
@@ -672,26 +642,17 @@ static void virtualChordInput(const C& args) {
 	if (args.is.queuedInput.empty() && args.is.newFrame) {
 		
 		// macros can either be A or B, depending on buttons.
-		bool macroB = args.getMacroBInput(gDirectionalOnly);
-		bool macroC = args.getMacroCInput(gDirectionalOnly);
+		bool macroB = args.getMacroBInput();
+		bool macroC = args.getMacroCInput();
 		std::pair<int, int> dxy = args.getDirectionalInput();
 		int dx = dxy.first;
 		int dy = dxy.second;
-
-		args.is.lastDir = 0;
 
 		auto multiInputCB = [](C::InputCB a, C::InputCB b) -> C::InputCB {
 			return [a, b](C::InputCBArg arg) {
 				a(arg);
 				b(arg);
 			};
-		};
-
-		auto queue22 = [&args](int macroButton) {
-			args.is.queuedInput.emplace(args.setDirCB(0, 1));
-			args.is.queuedInput.emplace(args.setDirCB(0, 0));
-			args.is.queuedInput.emplace(args.setDirCB(0, 1));
-			args.is.queuedInput.emplace(args.setButtonCB(macroButton));
 		};
 
 		// returns a value in the range 0-11 inclusive
@@ -716,75 +677,63 @@ static void virtualChordInput(const C& args) {
 
 			int macroButton = macroB ? iB : iC;
 
+			if (macroC && !args.is.virtualMacroCPrev)
+				macroButton = iC;
+
 			bool macroBCPressed = (macroB && !args.is.virtualMacroBPrev) || (macroC && !args.is.virtualMacroCPrev);
 
 			args.is.virtualMacroBPrev = macroB;
 			args.is.virtualMacroCPrev = macroC;
 
-			if (dy == -1)      args.is.lastDir = 1;
-			else if (dx == -1) args.is.lastDir = 2;
-			else if (dx == 1)  args.is.lastDir = 3;
-			else if (dy == 1)  args.is.lastDir = 2;
-
-			if ((!gDirectionalOnly && macroBCPressed) || args.is.lastDir != args.is.ignoreLastDir) {
-				if (dx == 0 && dy == 0 && !gDirectionalOnly) {
+			if (macroBCPressed) {
+				if (dx == 0 && dy == 0) {
 					// 22
-					queue22(macroButton);
+					args.is.queuedInput.emplace(args.setDirCB(0, 1));
+					args.is.queuedInput.emplace(args.setDirCB(0, 0));
+					args.is.queuedInput.emplace(args.setDirCB(0, 1));
+					args.is.queuedInput.emplace(args.setButtonCB(macroButton));
 				} else if (dy == -1) {
 					// 623
 					args.is.queuedInput.emplace(args.setDirCB(facing, 0));
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(facing, 1));
 					args.is.queuedInput.emplace(args.setButtonCB(macroButton));
-					args.is.used = true;
 				} else if (dx == facing) {
 					// 236
 
-					// TODO: the reason we need to wait is in order to prevent a dash (66) input
+					// the reason we need to wait is in order to prevent a dash (66) input
+					// TODO: this can be reduced in some circumstances perhaps
 					const size_t wait_time = get623WaitTime(facing);
 					for (size_t i = 0; i < wait_time; ++i) {
 						args.is.queuedInput.emplace(args.setDirCB(0, 0));
 					}
 
-					// this cancels 623B/C buffering, ensuring we do 236B/C instead.
-					args.is.queuedInput.emplace(args.setButtonCB(args.is.iD));
+					args.is.queuedInput.emplace(args.setButtonCB(args.is.iD)); // this cancels 623B/C buffering, ensuring we do 236B/C instead.
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(facing, 1));
 					args.is.queuedInput.emplace(multiInputCB(args.setDirCB(facing, 0), args.setButtonCB(macroButton)));
-					args.is.used = true;
 				} else if (dx == -facing) {
 					// 214
-					// TODO: the reason we need to wait is in order to prevent a backward dash (44) input
+					// the reason we need to wait is in order to prevent a backward dash (44) input
+					// TODO: can this be reduced in some circumstances?
 					const size_t wait_time = get623WaitTime(-facing);
 					for (size_t i = 0; i < wait_time; ++i) {
 						args.is.queuedInput.emplace(args.setDirCB(0, 0));
 					}
 
-					// this cancels 421B/C buffering, ensuring we do 214B/C instead.
-					args.is.queuedInput.emplace(args.setButtonCB(args.is.iD));
+					args.is.queuedInput.emplace(args.setButtonCB(args.is.iD)); // this cancels 421B/C buffering, ensuring we do 214B/C instead.
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(-facing, 1));
 					args.is.queuedInput.emplace(multiInputCB(args.setDirCB(-facing, 0), args.setButtonCB(macroButton)));
-					args.is.used = true;
 				} else if (dy == 1) {
 					// 421
 					args.is.queuedInput.emplace(args.setDirCB(-facing, 0));
 					args.is.queuedInput.emplace(args.setDirCB(0, 1));
 					args.is.queuedInput.emplace(args.setDirCB(-facing, 1));
 					args.is.queuedInput.emplace(args.setButtonCB(macroButton));
-					args.is.used = true;
 				}
 			}
 		} else {
-			if (gDirectionalOnly && dx == 0 && dy == 0 && !args.is.used) {
-				if (args.is.virtualMacroBPrev)
-					queue22(iB);
-				else if (args.is.virtualMacroCPrev)
-					queue22(iC);
-			}
-
-			args.is.used = false;
-
 			args.is.virtualMacroBPrev = false;
 			args.is.virtualMacroCPrev = false;
 		}
@@ -794,8 +743,6 @@ static void virtualChordInput(const C& args) {
 			args.is.dxprevs[i] = args.is.dxprevs[i + 1];
 		}
 		args.is.dxprevs[DISTINCTION_FRAMES_236_623 - 1] = dx;
-
-		args.is.ignoreLastDir = args.is.lastDir;
 
 		// prevent jumping if macro button is held unless the 'fly' button is also held.
 		if (args.getMacroInput()) args.preventJumping();
@@ -827,7 +774,7 @@ static void virtualChordInput(const C& args) {
 static void interceptDeviceStateKeyboard(char *keystate) {
 	for (size_t i = 0; i <= 1; ++i) {
 		KeyboardInputState &kis = keyboardstate[i];
-		if ((kis.enabled || kis.enabled2) && macroInputEnabled()) {
+		if (kis.enabled && macroInputEnabled()) {
 			if (gVirtualInput) {
 				virtualChordInput<KeyboardVirtualArgs>({keystate, kis, extraInputVirtualKeyboards[i]});
 			}
@@ -849,11 +796,7 @@ static void interceptDeviceStateGamepad(DIJOYSTATE* joystate) {
 		if (gTriggersEnabled) {
 			 joystate->rgbButtons[RGBBUTTON_SELECT_MAP] = 0x0;
 
-			 if (joystate->lZ < -gTriggersThreshold) {
-				joystate->rgbButtons[RGBBUTTON_SELECT_MAP] |= 0x80;
-			 }
-
-			 if (joystate->lZ > gTriggersThreshold) {
+			 if (joystate->lZ < -gTriggersThreshold || joystate->lZ > gTriggersThreshold) {
 				joystate->rgbButtons[RGBBUTTON_SELECT_MAP] |= 0x80;
 			 }
 		}
@@ -938,8 +881,7 @@ static int __stdcall Hooksendto(SOCKET s, char *buf, int len, int flags, sockadd
 
 	bool game = (packet.type == SokuLib::HOST_GAME || packet.type == SokuLib::CLIENT_GAME);
 
-	if (game 
-		&& (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
+	if (game && (packet.game.event.type == SokuLib::GAME_LOADED || packet.game.event.type == SokuLib::GAME_LOADED_ACK)) {
 		if (len > 0) {
 			 char *buff = new char[len + strlen(MARKER)];
 			 memcpy(buff, buf, len);
@@ -959,19 +901,6 @@ static int __stdcall Hooksendto(SOCKET s, char *buf, int len, int flags, sockadd
 	SokuLib::displayPacketContent(std::cout, packet);
 	std::cout << "\n";
 	#endif
-
-	if (game && packet.game.event.type == SokuLib::GAME_INPUT && netEnable && !gVirtualInput) {
-		SokuLib::GameInputEvent &input = packet.game.event.input;
-		if (input.sceneId == SokuLib::SCENEID_BATTLE) {
-			 std::lock_guard<std::mutex> guard(selectKeyFrameLookupMutex);
-			 int right = (packet.type == SokuLib::CLIENT_GAME); // client is always the right player.
-			 for (size_t i = 0; i < input.inputCount; ++i) {
-				//input.inputs[i].battle.select = selectKeyFrameLookup[2 * (input.frameId + i) + right];
-				printf("%d %d\n", (input.frameId+i), (input.inputs[i].battle.select));
-				fflush(stdout);
-			 }
-		}
-	}
 
 	n = Original_sendto(s, buf, len, flags, to, tolen);
 	if (n <= 0) {
@@ -1020,14 +949,6 @@ static int __stdcall Hookrecvfrom(SOCKET s, char *buf, int len, int flags, socka
 	std::cout << "\n";
 	#endif
 
-	if (n <= 0) {
-		return n;
-	}
-
-	if (packet.type != SokuLib::PacketType::HOST_GAME && packet.type != SokuLib::PacketType::CLIENT_GAME) {
-		return n;
-	}
-
 	return n;
 }
 
@@ -1037,9 +958,14 @@ ReadInputs readInputs = reinterpret_cast<ReadInputs>((uintptr_t)(0x0046C8E0));
 
 typedef void(__fastcall *ReadInputsFromDevice)(SokuLib::KeymapManager *km);
 ReadInputsFromDevice readInputsFromDevice = reinterpret_cast<ReadInputsFromDevice>((uintptr_t)(0x0040a1a0));
-ReadInputsFromDevice readInputsIntermediate = reinterpret_cast<ReadInputsFromDevice>((uintptr_t)(0x0040a370));
 
 static SokuLib::CharacterManager *localcm = nullptr;
+
+static void __fastcall readInputsHook(SokuLib::CharacterManager *cm) {
+	localcm = cm;
+	readInputs(cm);
+	localcm = nullptr;
+};
 
 static void __fastcall readInputsFromDeviceHook(SokuLib::KeymapManager *km) {
 
@@ -1057,16 +983,6 @@ static void __fastcall readInputsFromDeviceHook(SokuLib::KeymapManager *km) {
 	}
 
 	readInputsFromDevice(km);
-
-	if (localcm && localcm->keyManager->keymapManager == km) {
-		setSelectKeyForFrame(*localcm);
-	}
-};
-
-static void __fastcall readInputsHook(SokuLib::CharacterManager *cm){
-	localcm = cm;
-	readInputs(cm);
-	localcm = nullptr;
 };
 
 extern "C" {
@@ -1079,21 +995,15 @@ extern "C" {
 		::PathRemoveFileSpec(s_profilePath);
 		::PathAppend(s_profilePath, "ChordMacro.ini");
 
-		enable = ::GetPrivateProfileInt("ChordMacro", "Enabled", 1, s_profilePath) != 0;
 		gVirtualInput = ::GetPrivateProfileInt("ChordMacro", "VirtualInput", 1, s_profilePath) != 0;
 		gDebug = ::GetPrivateProfileInt("ChordMacro", "Debug", 0, s_profilePath) != 0;
-		gDirectionalOnly = ::GetPrivateProfileInt("ChordMacro", "DirectionalOnly", 1, s_profilePath) != 0;
 		gTriggersEnabled = ::GetPrivateProfileInt("GamepadInput", "TriggerEnabled", 0, s_profilePath) != 0;
 		gTriggersThreshold = ::GetPrivateProfileInt("GamepadInput", "TriggerThreshold", 200, s_profilePath);
 
 		keyboardstate[0].enabled = ::GetPrivateProfileInt("KeyboardInput", "MacroKey", -1, s_profilePath) >= 0;
 		keyboardstate[0].iMacro = ::GetPrivateProfileInt("KeyboardInput", "MacroKey", DIK_LSHIFT, s_profilePath);
-		keyboardstate[0].enabled2 = ::GetPrivateProfileInt("KeyboardInput", "MacroKey2", -1, s_profilePath) >= 0;
-		keyboardstate[0].iMacro2 = ::GetPrivateProfileInt("KeyboardInput", "MacroKey2", DIK_LSHIFT, s_profilePath);
 		keyboardstate[1].enabled = ::GetPrivateProfileInt("KeyboardInput", "MacroKey", -1, s_profilePath) >= 0;
 		keyboardstate[1].iMacro = ::GetPrivateProfileInt("KeyboardInputP2", "MacroKey", DIK_RSHIFT, s_profilePath);
-		keyboardstate[1].enabled2 = ::GetPrivateProfileInt("KeyboardInputP2", "MacroKey2", -1, s_profilePath) >= 0;
-		keyboardstate[1].iMacro2 = ::GetPrivateProfileInt("KeyboardInputP2", "MacroKey2", DIK_RSHIFT, s_profilePath);
 
 		// load DirectInput library since it won't be otherwise loaded yet
     
@@ -1108,19 +1018,19 @@ extern "C" {
 		og_BattleManagerArcadeOnProcess = SokuLib::TamperDword(&VTable_BattleManagerArcade.onProcess, BattleOnProcessArcade);
 		VirtualProtect((PVOID)RDATA_SECTION_OFFSET, RDATA_SECTION_SIZE, old, &old);
 
-		// enable sending SELECT over the network.
+		// enable sending SELECT over netplay.
 		char *patchaddr3 = (char *)0x004559d5;
 		char *patchaddr4 = (char *)0x00454cc0;
 		char *patchaddr5 = (char *)0x00454cd5;
 
-		VirtualProtect(patchaddr3, 100, PAGE_EXECUTE_WRITECOPY, &old);
+		VirtualProtect(patchaddr3, 5, PAGE_EXECUTE_WRITECOPY, &old);
 		patchaddr3[3] = 8|3;
-		VirtualProtect(patchaddr3, 100, old, &old);
+		VirtualProtect(patchaddr3, 5, old, &old);
 		
-		VirtualProtect(patchaddr4, 100, PAGE_EXECUTE_WRITECOPY, &old);
+		VirtualProtect(patchaddr4, 6, PAGE_EXECUTE_WRITECOPY, &old);
 		patchaddr4[3] = 8|3;
 		patchaddr5[4] = 8|3;
-		VirtualProtect(patchaddr4, 100, old, &old);
+		VirtualProtect(patchaddr4, 6, old, &old);
    
 		Original_recvfrom = (recvfromFn)PatchMan::HookNear(0x41DAE5, (DWORD)Hookrecvfrom);
 		Original_sendto = (sendtoFn)PatchMan::HookNear(0x4171CD, (DWORD)Hooksendto);
@@ -1132,9 +1042,7 @@ extern "C" {
 			DetourTransactionCommit();
 		}
 		ChordInputDetectDetour();
-		if (gTriggersEnabled || keyboardstate[0].enabled || keyboardstate[1].enabled || keyboardstate[0].enabled2 || keyboardstate[1].enabled2) {
-			DummyDirectInput();
-		}
+		DummyDirectInput();
 
 
 		return true;
